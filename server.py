@@ -1,4 +1,5 @@
 import errno
+import hmac
 import os
 import sys
 import asyncio
@@ -157,6 +158,27 @@ async def compress_body(request: web.Request, handler):
     return response
 
 
+def create_bearer_token_middleware(token: str):
+    """Reject every request that lacks ``Authorization: Bearer <token>``.
+
+    Used by ComfyStudio, which launches a private server and passes a per-launch
+    token in the COMFYSTUDIO_API_TOKEN environment variable. There are no path
+    exemptions and no query-parameter fallback, so the /ws upgrade is covered too.
+    The rejection carries no body and never mentions the token.
+    """
+    expected = token.encode("utf-8")
+
+    @web.middleware
+    async def bearer_token_middleware(request: web.Request, handler):
+        header = request.headers.get("Authorization", "")
+        scheme, _, supplied = header.partition(" ")
+        if scheme.lower() != "bearer" or not hmac.compare_digest(supplied.strip().encode("utf-8", "surrogateescape"), expected):
+            return web.Response(status=401, headers={"WWW-Authenticate": "Bearer"})
+        return await handler(request)
+
+    return bearer_token_middleware
+
+
 def create_cors_middleware(allowed_origin: str):
     @web.middleware
     async def cors_middleware(request: web.Request, handler):
@@ -277,6 +299,10 @@ class PromptServer():
         self.number = 0
 
         middlewares = [cache_control, deprecation_warning]
+        api_token = os.environ.get("COMFYSTUDIO_API_TOKEN", "")
+        if api_token:
+            # First, so unauthenticated requests do no other work.
+            middlewares.insert(0, create_bearer_token_middleware(api_token))
         if args.enable_compress_response_body:
             middlewares.append(compress_body)
 
